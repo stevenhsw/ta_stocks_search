@@ -12,7 +12,8 @@ from config import *
 def exp_smooth(series: pd.Series, alpha: float = 0.1) -> None:
     series_cpy = pd.Series.copy(series)
     size = len(series_cpy)
-    assert size > 0
+    if size < 1:
+        return series_cpy
     carry = None
     for i in range(0, size - 1):
         if pd.isna(series_cpy[i + 1]):
@@ -32,7 +33,7 @@ def update_tickers(fname: str, start: int = 1, end: int = 1000) -> None:
     for i in range(0, len(tickers), INTERVAL):
         tickers_subset = tickers[i:i + INTERVAL]
         data = pdr.get_data_yahoo(tickers_subset, start=START_DATE)
-        data = data["Close"]
+        data = data[CLOSE]
         if len(tickers_subset) > 1:
             for ticker in tickers_subset:
                 if not data[ticker].isnull().all():
@@ -46,15 +47,34 @@ def update_tickers(fname: str, start: int = 1, end: int = 1000) -> None:
 
 
 def get_number_of_matches(close: pd.Series, high: pd.Series, 
-                          low: pd.Series, n_prev_days: int) -> (int, pd.Series):
+                          low: pd.Series, volume: pd.Series, n_prev_days: int) -> (int, pd.Series):
     ticker_data = pd.DataFrame()
+    ticker_data[CLOSE] = close
+    ticker_data[HIGH] = high
+    ticker_data[LOW] = low
+    ticker_data[VOLUME] = volume
     ticker_data[RSI] = exp_smooth(rsi_wrapper(close))
     ticker_data[WILLIAM_R] = exp_smooth(william_wrapper(high, low, close))
     ticker_data[ADX_POS], ticker_data[ADX_NEG] = adx_wrapper(high, low, close)
     ticker_data[MACD], ticker_data[EMA] = macd_wrapper(close)
-    prev_month_data = ticker_data.iloc[-n_prev_days:, :]
-    selection = prev_month_data[(prev_month_data[RSI] >= THRESHOLD_CONFIG[RSI]) & (prev_month_data[WILLIAM_R] >= THRESHOLD_CONFIG[WILLIAM_R]) & (prev_month_data[ADX_POS] > prev_month_data[ADX_NEG]) & (prev_month_data[MACD] > prev_month_data[EMA])]
-    return len(selection), ticker_data
+    ticker_data[CHAIKIN] = chaikin_wrapper(high, low, close, volume)
+    rules = make_rules(ticker_data)
+    rules = rules.iloc[-n_prev_days:]
+    return rules.sum(), ticker_data
+
+
+def make_rules(data: pd.DataFrame):
+    rules = data[RSI] >= THRESHOLD_CONFIG[RSI]
+    rules &= data[WILLIAM_R] >= THRESHOLD_CONFIG[WILLIAM_R] 
+    rules &= data[ADX_POS] > data[ADX_NEG]
+    rules &= data[MACD] > data[EMA]
+    rules &= data[CHAIKIN] > 0
+    rules &= data[VOLUME] >= 30_000_000
+    max_90_close_price = max(data[CLOSE][-90:])
+    rules &= data[CLOSE] >= max_90_close_price
+    rules &= data[RSI].diff() > 0
+    rules &= data[WILLIAM_R].diff() > 0
+    return rules
 
 
 def rsi_wrapper(close: pd.Series) -> pd.Series:
@@ -83,6 +103,11 @@ def macd_wrapper(close: pd.Series) -> (pd.Series, pd.Series):
     return macd_series.macd(), macd_series.macd_signal()
 
 
+def chaikin_wrapper(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series):
+    chaikin_series = ta.volume.ChaikinMoneyFlowIndicator(high, low, close, volume)
+    return chaikin_series.chaikin_money_flow()
+
+
 def market_cap_filter(tickers: List[str], threshold: int = 5_000_000_000) -> List[str]:
     res = []
     for ticker in tickers:
@@ -107,7 +132,7 @@ def market_cap_filter_threaded(tickers: List[str], threshold: int = 5_000_000_00
     return res
 
 
-def get_ticker_info(tickers: List[str]) -> List[Tuple[str, Dict[str, int]]]:
+def get_ticker_info(tickers: List[str]) -> List[Tuple[str, Dict[str, float]]]:
     res = []
     info_keys = TICKER_INFO
 
@@ -134,7 +159,7 @@ def get_ticker_info_threaded(tickers: List[str], n_threads: int = 50) -> List[Tu
     return res
 
 
-def make_result_dataframe(ticker_info: List[Tuple[str, Dict[str, int]]], 
+def make_result_dataframe(ticker_info: List[Tuple[str, Dict[str, float]]], 
                           ticker_to_indicators: Dict[str, pd.DataFrame]):
     assert len(ticker_info) > 0
     sample_name, sample_dict = ticker_info[0][0], ticker_info[0][1]
@@ -152,3 +177,13 @@ def make_result_dataframe(ticker_info: List[Tuple[str, Dict[str, int]]],
     
     return pd.DataFrame(data,
                         columns = ['name', *list(static_keys), *list(indicators)])
+
+
+def append_n_day_average_volume(info: List[Tuple[str, Dict[str, float]]], 
+                                ticker_to_df: Dict[str, pd.DataFrame], n_day: int):
+    for ticker, info_dict in info:
+        info_dict[f'{n_day}_day_average'] = get_n_day_average_volume(ticker_to_df[ticker]['Volume'], n_day)
+    
+
+def get_n_day_average_volume(volume: pd.Series, n_day: int) -> float:
+    return float(volume[-n_day:].mean())
